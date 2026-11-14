@@ -1,4 +1,4 @@
-import { runBars, BarsState, Batch, Fill } from './vendor/makefun-bars.ts';
+import { runBars, BarsState, type Batch, type Fill } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 const WARMUP = 360;
