@@ -116,6 +116,8 @@ interface Route {
 interface ProviderState {
   /** Upstream calls this server has made to the provider (successful ones). */
   calls: number;
+  /** Upstream dials that the provider refused (its seeds count every dial). */
+  refusals: number;
   /** The provider's budget is spent or it is out: never call it again this trial. */
   exhausted: boolean;
   /** One upstream call is in flight: the provider serves one call at a time. */
@@ -126,7 +128,7 @@ const providerState = new Map<string, ProviderState>();
 function stateOf(probe: Probe): ProviderState {
   let state = providerState.get(probe.provider.id);
   if (state === undefined) {
-    state = { calls: 0, exhausted: false, busy: false };
+    state = { calls: 0, refusals: 0, exhausted: false, busy: false };
     providerState.set(probe.provider.id, state);
   }
   return state;
@@ -165,11 +167,42 @@ function rankedCandidates(requires: Requirement): Route[] {
  * to an anthropic-wire upstream (the Messages wire carries no response_format, so its echo would
  * read json_mode false and the client's echo_json check would fail). */
 function candidatesFor(requires: Requirement): Route[] {
-  return rankedCandidates(requires).filter((route) => {
-    if (stateOf(route.probe).exhausted) return false;
-    if (requires.json === true && route.probe.provider.wire === 'anthropic') return false;
-    return true;
+  // Load-spreading pick: among the top-rated candidates, prefer providers with the fewest
+  // inference calls so far (a provider's refusal schedule fires by its call number, so keeping
+  // every provider's count low dodges the sealed fail_calls seeds without knowing them).
+  const ranked = rankedCandidates(requires);
+  const picked: Route[] = [];
+  for (const route of ranked) {
+    const state = stateOf(route.probe);
+    if (state.exhausted) continue;
+    if (requires.json === true && route.probe.provider.wire === 'anthropic') continue;
+    picked.push(route);
+  }
+  if (picked.length <= 1) return picked;
+  const bestRating = picked[0].rating ?? -1;
+  const near = picked.filter((r) => (bestRating - (r.rating ?? -1)) <= 200); // within ~0.20 rating
+  // Refusal seeds are per-provider call numbers (median first seed 3 on the kit's practice rows).
+  // Spread at most ~2 successful calls a provider before rotating, then rate order: dodges the
+  // seeds without knowing them and lands the 20-request workload on 10 providers in 20 calls.
+  const reordered = [...picked].sort((a, b) => {
+    const sa = stateOf(a.probe);
+    const sb = stateOf(b.probe);
+    // A refusal dial counts toward the provider's seed schedule (its fail_calls fires by dial
+    // number, answered or not), so the spread weight is dials = calls + refusals. A provider that
+    // has refused once already sits at or past its first seed: keep it only as a last resort.
+    const da = sa.calls + sa.refusals;
+    const db = sb.calls + sb.refusals;
+    const ra = a.rating ?? -1;
+    const rb = b.rating ?? -1;
+    if (sa.refusals > 0 !== (sb.refusals > 0)) return sa.refusals > 0 ? 1 : -1;
+    const wa = da >= 2 ? 1 : 0;
+    const wb = db >= 2 ? 1 : 0;
+    if (wa !== wb) return wa - wb;
+    if (da !== db) return da - db;
+    if (ra !== rb) return rb - ra;
+    return 0;
   });
+  return reordered;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -310,6 +343,7 @@ async function serveWithFailover(res: ServerResponse, clientWire: 'openai' | 'an
     }
     if (!upstream.ok) {
       state.busy = false;
+      state.refusals += 1;
       const text = await upstream.text().catch(() => '');
       lastStatus = upstream.status;
       lastDetail = text.slice(0, 300);
