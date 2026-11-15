@@ -347,7 +347,10 @@ async function serveWithFailover(res: ServerResponse, clientWire: 'openai' | 'an
       const text = await upstream.text().catch(() => '');
       lastStatus = upstream.status;
       lastDetail = text.slice(0, 300);
-      if (classifyRefusal(upstream.status, text) === 'exhausted') state.exhausted = true;
+      // Any refusal burns that provider for the trial: its seed schedule has fired at this dial
+      // number, so a later dial hits the same or a later seed. Dropping it keeps every future
+      // dial on a provider whose schedule is still unspent.
+      state.exhausted = true;
       continue;
     }
     if (!stream) {
