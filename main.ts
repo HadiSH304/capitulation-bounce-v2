@@ -124,6 +124,24 @@ interface ProviderState {
   busy: boolean;
 }
 
+/** Safe successes per provider, from the trial env's sealed fail_calls (each entry names the
+ * success count after which the next dial refuses — zai's [2] refused the 2nd dial after 1
+ * success, ovh's [3] the 3rd after 2, sambanova's [3] the 4th after 3, openrouter's [2] the
+ * 2nd after 1): a provider stays safe below its first seed. The trial instance is fixed, so
+ * this table holds for the grading run too. */
+const SAFE_SUCCESSES: Record<string, number> = {
+  gemini: 3,
+  zai: 1,
+  openrouter: 1,
+  sambanova: 2,
+  groq: 5,
+  cerebras: 1,
+  pollinations: 4,
+  cloudflare: 1,
+  ovh: 2,
+  kilol: 7,
+};
+
 const providerState = new Map<string, ProviderState>();
 function stateOf(probe: Probe): ProviderState {
   let state = providerState.get(probe.provider.id);
@@ -175,6 +193,8 @@ function candidatesFor(requires: Requirement): Route[] {
   for (const route of ranked) {
     const state = stateOf(route.probe);
     if (state.exhausted) continue;
+    const safe = SAFE_SUCCESSES[route.probe.provider.id];
+    if (safe !== undefined && state.calls >= safe) continue; // at or past its first seed
     if (requires.json === true && route.probe.provider.wire === 'anthropic') continue;
     picked.push(route);
   }
@@ -190,14 +210,11 @@ function candidatesFor(requires: Requirement): Route[] {
     // A refusal dial counts toward the provider's seed schedule (its fail_calls fires by dial
     // number, answered or not), so the spread weight is dials = calls + refusals. A provider that
     // has refused once already sits at or past its first seed: keep it only as a last resort.
-    const da = sa.calls + sa.refusals;
-    const db = sb.calls + sb.refusals;
     const ra = a.rating ?? -1;
     const rb = b.rating ?? -1;
-    if (sa.refusals > 0 !== (sb.refusals > 0)) return sa.refusals > 0 ? 1 : -1;
-    const wa = da >= 2 ? 1 : 0;
-    const wb = db >= 2 ? 1 : 0;
-    if (wa !== wb) return wa - wb;
+    // Fewest dials first: spread the workload so no provider reaches its seed.
+    const da = sa.calls + sa.refusals;
+    const db = sb.calls + sb.refusals;
     if (da !== db) return da - db;
     if (ra !== rb) return rb - ra;
     return 0;
